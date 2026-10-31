@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
 """
-Local Webhook Tester for Render OTP Agent
-==========================================
-Simulates an authentic Render Log Streams webhook POST request to your
-locally running FastAPI server (http://localhost:8000/webhook/render-logs).
-
-Verifies:
-1. Server connectivity (/healthz)
-2. Log ingestion & regex parsing (extracting email and OTP)
-3. Instant email dispatch via Gmail SMTP SSL
-4. Deduplication cache behavior
+VeloTest Local Webhook Tester for Render OTP Agent
+===================================================
+Simulates authentic Render Log Streams webhook POST requests containing
+various VeloTest platform log formats to verify parsing, deduplication,
+and email dispatch (via Brevo API or Gmail SMTP) on your local server.
 """
 
 import os
@@ -21,7 +16,6 @@ import urllib.request
 import urllib.error
 from datetime import datetime, timezone
 
-# Load environment variables if .env exists
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -30,7 +24,7 @@ except ImportError:
 
 DEFAULT_SERVER_URL = "http://localhost:8000"
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
-DEFAULT_EMAIL = os.getenv("EMAIL_USER", "user@example.com").strip()
+DEFAULT_EMAIL = os.getenv("EMAIL_USER", "velotest2026@gmail.com").strip()
 
 
 def check_health(base_url: str) -> bool:
@@ -40,7 +34,7 @@ def check_health(base_url: str) -> bool:
         req = urllib.request.Request(health_url, method="GET")
         with urllib.request.urlopen(req, timeout=3) as res:
             if res.getcode() == 200:
-                print(f"[+] Server is healthy at {health_url}")
+                print(f"[+] Server is reachable and healthy at {health_url}")
                 return True
     except Exception as e:
         print(f"[!] Could not connect to {health_url}: {e}")
@@ -54,42 +48,50 @@ def send_simulated_webhook(
     base_url: str,
     recipient_email: str,
     otp_code: str,
+    format_type: str = "standard",
     token: str = None
 ) -> dict:
     """Send a simulated Render Log Stream payload to the webhook endpoint."""
     webhook_url = f"{base_url.rstrip('/')}/webhook/render-logs"
-
     now_iso = datetime.now(timezone.utc).isoformat()
 
-    # Typical Render Log Stream payload containing a batch of logs
+    # Generate log message based on format_type
+    if format_type == "velotest_bracket":
+        msg = f"[VeloTest] Candidate {recipient_email} verification code generated: {otp_code}"
+    elif format_type == "json":
+        msg = json.dumps({"service": "velotest", "event": "otp_request", "email": recipient_email, "otp": otp_code})
+    elif format_type == "colon":
+        msg = f"OTP for {recipient_email}: {otp_code}"
+    else:
+        msg = f"OTP sent to {recipient_email}: {otp_code}"
+
     payload = {
         "logs": [
             {
                 "id": "log-001",
                 "timestamp": now_iso,
-                "message": "Application server received POST /api/auth/login",
+                "message": "VeloTest backend initialized session",
                 "level": "info",
-                "labels": {"serviceId": "srv-test123456"}
+                "labels": {"serviceId": "srv-velotest"}
             },
             {
                 "id": "log-002",
                 "timestamp": now_iso,
-                "message": f"OTP sent to {recipient_email}: {otp_code}",
+                "message": msg,
                 "level": "info",
-                "labels": {"serviceId": "srv-test123456"}
+                "labels": {"serviceId": "srv-velotest"}
             },
             {
                 "id": "log-003",
                 "timestamp": now_iso,
-                "message": "Auth controller dispatched security event notification",
+                "message": "Auth event recorded in VeloTest database",
                 "level": "info",
-                "labels": {"serviceId": "srv-test123456"}
+                "labels": {"serviceId": "srv-velotest"}
             }
         ]
     }
 
     json_data = json.dumps(payload).encode("utf-8")
-
     headers = {
         "Content-Type": "application/json",
         "User-Agent": "Render-Log-Stream/1.0"
@@ -107,25 +109,25 @@ def send_simulated_webhook(
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=10) as response:
+        with urllib.request.urlopen(req, timeout=12) as response:
             status_code = response.getcode()
             body = response.read().decode("utf-8")
-            return {"status_code": status_code, "body": json.loads(body)}
+            return {"status_code": status_code, "body": json.loads(body), "sent_message": msg}
     except urllib.error.HTTPError as e:
         error_body = e.read().decode("utf-8", errors="replace")
-        return {"status_code": e.code, "error": error_body}
+        return {"status_code": e.code, "error": error_body, "sent_message": msg}
     except Exception as e:
-        return {"status_code": 0, "error": str(e)}
+        return {"status_code": 0, "error": str(e), "sent_message": msg}
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Simulate a Render Log Stream webhook POST request to your local FastAPI server"
+        description="Simulate Render Log Streams for VeloTest OTP Agent"
     )
     parser.add_argument(
         "--url", "-u",
         default=DEFAULT_SERVER_URL,
-        help=f"Base URL of your running FastAPI app (default: {DEFAULT_SERVER_URL})"
+        help=f"Base URL of running FastAPI app (default: {DEFAULT_SERVER_URL})"
     )
     parser.add_argument(
         "--email", "-e",
@@ -138,15 +140,10 @@ def main():
         help="Custom OTP code to test (default: random 6-digit number)"
     )
     parser.add_argument(
-        "--token",
-        default=None,
-        help="Webhook secret token for Authorization header (default: from .env WEBHOOK_SECRET)"
-    )
-    parser.add_argument(
-        "--test-dedup",
-        action="store_true",
-        default=True,
-        help="Test deduplication by sending the exact same payload twice"
+        "--format", "-f",
+        choices=["standard", "velotest_bracket", "json", "colon"],
+        default="standard",
+        help="Log line format to test (standard, velotest_bracket, json, colon)"
     )
     args = parser.parse_args()
 
@@ -154,12 +151,12 @@ def main():
     target_email = args.email
 
     print("=================================================================")
-    print(" 🚀 Render Real-Time Webhook Local Simulator")
+    print(" 🚀 VeloTest Render Webhook Local Simulator")
     print("=================================================================")
     print(f" Target Webhook  : {args.url.rstrip('/')}/webhook/render-logs")
     print(f" Recipient Email : {target_email}")
     print(f" Test OTP Code   : {test_otp}")
-    print(f" Simulated Log   : 'OTP sent to {target_email}: {test_otp}'")
+    print(f" Format Selected : {args.format}")
     print("=================================================================\n")
 
     # 1. Health Check
@@ -167,48 +164,47 @@ def main():
     if not check_health(args.url):
         sys.exit(1)
 
-    # 2. First Webhook Delivery
-    print(f"[2/3] Sending simulated Render Log Stream payload...")
+    # 2. Webhook Delivery
+    print("[2/3] Sending simulated VeloTest Render Log Stream payload...")
     res = send_simulated_webhook(
         base_url=args.url,
         recipient_email=target_email,
         otp_code=test_otp,
-        token=args.token
+        format_type=args.format
     )
 
     if res.get("status_code") == 200:
-        print("[SUCCESS] Webhook accepted by server (HTTP 200 OK)!")
-        print(f"Response: {json.dumps(res.get('body'), indent=2)}")
-        print(f"\n📧 Check inbox for '{target_email}' to confirm email delivery!")
+        print(f"[SUCCESS] Webhook accepted by server (HTTP 200 OK)!")
+        print(f"Log message simulated: \"{res.get('sent_message')}\"")
+        print(f"Server Response:\n{json.dumps(res.get('body'), indent=2)}")
+        print(f"\n📧 Check inbox for '{target_email}' to verify email arrival!")
     else:
-        print(f"[ERROR] Request failed with status {res.get('status_code')}:")
+        print(f"[ERROR] Request failed with HTTP {res.get('status_code')}:")
         print(res.get("error", "Unknown error"))
         sys.exit(1)
 
-    # 3. Test Deduplication
-    if args.test_dedup:
-        print("\n[3/3] Sending identical payload immediately to verify deduplication...")
-        dedup_res = send_simulated_webhook(
-            base_url=args.url,
-            recipient_email=target_email,
-            otp_code=test_otp,
-            token=args.token
-        )
-        if dedup_res.get("status_code") == 200:
-            body = dedup_res.get("body", {})
-            otps_matched = body.get("otps_matched", 0)
-            if otps_matched == 0:
-                print("[SUCCESS] Deduplication verified! Duplicate OTP was safely ignored.")
-            else:
-                print(f"[WARN] Deduplication returned matched count: {otps_matched}")
+    # 3. Deduplication Check
+    print("\n[3/3] Sending identical payload immediately to verify deduplication...")
+    dedup_res = send_simulated_webhook(
+        base_url=args.url,
+        recipient_email=target_email,
+        otp_code=test_otp,
+        format_type=args.format
+    )
+    if dedup_res.get("status_code") == 200:
+        body = dedup_res.get("body", {})
+        otps_matched = body.get("otps_matched", 0)
+        if otps_matched == 0:
+            print("[SUCCESS] Deduplication verified! Duplicate OTP was safely ignored.")
         else:
-            print(f"[WARN] Deduplication request returned: {dedup_res}")
+            print(f"[WARN] Deduplication returned matched count: {otps_matched}")
+    else:
+        print(f"[WARN] Deduplication test request returned error: {dedup_res}")
 
     print("\n=================================================================")
-    print(" Test completed successfully.")
+    print(" Test finished.")
     print("=================================================================")
 
 
 if __name__ == "__main__":
     main()
-

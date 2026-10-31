@@ -1,156 +1,166 @@
-# ⚡ Render Real-Time OTP Webhook Log Receiver
+# ⚡ VeloTest Real-Time OTP Webhook Agent
 
-A high-performance, asynchronous web service built with **FastAPI** that receives real-time log streams directly from **Render Log Streams (Log Drains)** via HTTPS Webhook.
+A dedicated, high-performance **FastAPI** webhook log receiver and email dispatcher engineered to seamlessly accommodate the **VeloTest** platform on [Render](https://render.com) **with zero modifications required in VeloTest**.
 
-It inspects incoming log payloads in sub-seconds, extracts the **dynamic recipient user email** and **OTP verification code**, and immediately dispatches an email via **Gmail SMTP SSL (port 465)**.
-
----
-
-## 🌟 Why Webhook Instead of Polling?
-
-| Metric | Old Polling Script | New Webhook Log Receiver |
-| :--- | :--- | :--- |
-| **Latency** | 15 – 60 seconds delay | **< 100 milliseconds (Instantaneous)** |
-| **Concurrency** | Single sequential loop | **Hundreds of concurrent users** |
-| **Target Email** | Fixed static admin email | **Dynamic user email extracted per log** |
-| **Rate Limits** | Hits Render REST API rate limits | **Zero polling — Render pushes to you** |
-| **Hosting** | Requires your PC running or cron | **Runs 24/7 free on Render** |
+Whenever VeloTest generates or logs an OTP verification code, Render's native **Log Streams (Log Drains)** immediately forward the log line to this service over HTTPS. The agent extracts both the **target candidate/user email** and the **OTP code**, then delivers a branded verification email via **Brevo REST API** or **Gmail SMTP SSL (port 465)**.
 
 ---
 
-## 📁 Repository Structure
+## 🏗️ Architecture: Zero Changes to VeloTest
 
 ```
-otpsender_email/
-├── app.py              # Main FastAPI Webhook & SMTP Dispatcher
-├── requirements.txt    # Production dependencies (FastAPI, Uvicorn, python-dotenv)
-├── Procfile            # Render web server start command
-├── render.yaml         # One-click Render Blueprint specification
-├── test_webhook.py     # Local verification test suite
-├── .env.example        # Environment variable template
-└── README.md           # Documentation & setup instructions
+┌───────────────────────────────────────────────┐
+│              Existing VeloTest Platform       │
+│  (Emits stdout log: "OTP sent to user: code") │
+└───────────────────────┬───────────────────────┘
+                        │
+                        ▼ (Automatic Real-Time Push)
+┌───────────────────────────────────────────────┐
+│        Render HTTPS Log Stream / Drain        │
+└───────────────────────┬───────────────────────┘
+                        │
+                        ▼ (POST /webhook/render-logs)
+┌───────────────────────────────────────────────┐
+│           VeloTest Render OTP Agent           │
+│         (FastAPI running on Render Free)      │
+│  - Inspects incoming JSON/NDJSON log batch    │
+│  - Multi-pattern regex extracts email & OTP   │
+│  - In-memory TTL deduplication prevents duplicates│
+│  - Returns 200 OK to Render in < 10ms         │
+└───────────────────────┬───────────────────────┘
+                        │
+                        ▼ (Non-blocking Background Task)
+         ┌──────────────┴──────────────┐
+         ▼                             ▼
+   [Brevo REST API]            [Gmail SMTP SSL 465]
+ (api.brevo.com/v3/smtp/email)    (smtp.gmail.com:465)
+         │                             │
+         └──────────────┬──────────────┘
+                        │
+                        ▼
+         ┌─────────────────────────────┐
+         │     Candidate's Inbox       │
+         │   (Branded HTML OTP Card)   │
+         └─────────────────────────────┘
 ```
 
 ---
 
-## 📋 Prerequisites
+## 🎯 Flexible Log Parsing Formats
 
-1. **Gmail Account with 2FA**:
-   - Turn on **2-Step Verification** on your Google Account.
-   - Go to [Google App Passwords](https://myaccount.google.com/apppasswords).
-   - Generate a 16-character password named `RenderOTPWebhook`.
-2. **Render Account**: Free tier account at [render.com](https://render.com).
+The parser automatically recognizes all standard and custom formats produced by VeloTest:
+
+| Log Style | Example Log Message | Extracted Email | Extracted OTP |
+| :--- | :--- | :--- | :--- |
+| **Standard** | `OTP sent to student@velotest.com: 593821` | `student@velotest.com` | `593821` |
+| **Bracketed** | `[VeloTest] Candidate user@exam.org OTP generated: 849201` | `user@exam.org` | `849201` |
+| **Reversed** | `Sent OTP 123456 to candidate@gmail.com` | `candidate@gmail.com` | `123456` |
+| **Key-Value** | `VeloTest Auth | email: user@test.net | code: 771234` | `user@test.net` |
+| **JSON Log** | `{"service": "velotest", "email": "alice@velotest.io", "otp": "993821"}` | `alice@velotest.io` | `993821` |
+| **Colon Style** | `OTP for student@velotest.com: 654321` | `student@velotest.com` | `654321` |
+
+*Need a unique pattern? Set `OTP_CUSTOM_REGEX` in `.env` to override at any time.*
 
 ---
 
-## 🛠️ Step 1: Configure Environment Variables
+## ⚙️ Environment Configuration (`.env`)
 
-Create or edit `.env` based on `.env.example`:
+Configure either **Brevo API** (recommended for production volume) or **Gmail SMTP**:
 
 ```env
-# Gmail SMTP Credentials
-EMAIL_USER=your_sender_gmail@gmail.com
-EMAIL_PASS=abcd efgh ijkl mnop
+# 1. Provider Selection: 'auto', 'brevo', or 'gmail'
+# 'auto' prioritizes Brevo if BREVO_API_KEY is present, else falls back to Gmail SMTP
+EMAIL_PROVIDER=auto
 
-# Optional: Webhook Secret Token (matches Token set in Render Log Streams)
-WEBHOOK_SECRET=your_optional_secret_token
+# 2. Option A: Brevo (Sendinblue) API Credentials
+BREVO_API_KEY=xkeysib-your_brevo_api_key_here
+BREVO_SENDER_EMAIL=no-reply@yourdomain.com
+BREVO_SENDER_NAME=VeloTest Verification
 
-# Optional Settings
-APP_NAME=Render OTP Dispatcher
+# 3. Option B: Gmail SMTP Credentials
+EMAIL_USER=velotest2026@gmail.com
+EMAIL_PASS=your_16_char_gmail_app_password
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=465
+
+# 4. Webhook Security (Optional)
+# If you set a token in Render's Log Stream configuration, place it here:
+WEBHOOK_SECRET=
+
+# 5. App Settings
+APP_NAME=VeloTest Verification
 DEDUP_CACHE_TTL=300
 PORT=8000
 ```
 
 ---
 
-## 🧪 Step 2: Test Locally
+## 🧪 Local Verification & Testing
+
+Before deploying, you can test everything on your machine:
 
 ### 1. Install Dependencies
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. Run the Test Suite
-Verify that the regex parser and deduplication logic extract target emails and OTP codes accurately:
+### 2. Run the Parser Unit Tests
+Verifies all VeloTest formats against regex & deduplication:
 ```bash
 python test_webhook.py
 ```
 
-### 3. Run the Web Server Locally
+### 3. Start Local FastAPI Webhook Server
 ```bash
-python -m uvicorn app:app --reload --port 8000
+uvicorn app:app --reload --port 8000
 ```
-Visit `http://localhost:8000/docs` in your browser to view the interactive OpenAPI/Swagger documentation.
+
+### 4. Run the Local Simulator (Sends real test email)
+In another terminal, simulate Render pushing a VeloTest log:
+```bash
+python test_local.py --email your_email@gmail.com --format standard
+```
+Other test formats available:
+```bash
+python test_local.py --email your_email@gmail.com --format velotest_bracket
+python test_local.py --email your_email@gmail.com --format json
+```
+Check your inbox to verify the arrival of the branded VeloTest verification card.
 
 ---
 
-## 🚀 Step 3: Deploy Free 24/7 on Render
+## 🚀 Mapping Render's Log Streams to VeloTest
 
-### Method A: Connect Your GitHub/GitLab Repository
-1. Push this repository to GitHub/GitLab (when you are ready).
-2. Go to the [Render Dashboard](https://dashboard.render.com).
-3. Click **New +** $\rightarrow$ **Web Service**.
-4. Select your repository.
-5. Configure the service:
-   - **Name**: `render-otp-webhook`
-   - **Environment**: `Python 3`
-   - **Region**: Oregon (or your preferred region)
-   - **Branch**: `main`
+Once you deploy this agent as a free web service on Render, wire it to your existing VeloTest deployment in under 60 seconds:
+
+### Step 1: Deploy `render-otp-agent` on Render
+1. Push this repository to GitHub/GitLab.
+2. In [Render Dashboard](https://dashboard.render.com), click **New +** $\rightarrow$ **Web Service**.
+3. Select this repository:
+   - **Runtime**: Python 3
    - **Build Command**: `pip install -r requirements.txt`
    - **Start Command**: `uvicorn app:app --host 0.0.0.0 --port $PORT`
-   - **Instance Type**: **Free**
+   - **Plan**: **Free**
    - **Health Check Path**: `/healthz`
-6. Under **Environment Variables**, add:
-   - `EMAIL_USER`: Your Gmail address
-   - `EMAIL_PASS`: Your 16-character Gmail App Password
-   - `WEBHOOK_SECRET`: (Optional) Your secret security token
-7. Click **Create Web Service**.
+4. Add your `.env` variables (`BREVO_API_KEY` or `EMAIL_USER` / `EMAIL_PASS`).
+5. Copy your deployed service URL (e.g., `https://velotest-otp-agent.onrender.com`).
 
-Once deployed, Render gives you a public URL such as:
-`https://render-otp-webhook-xxxx.onrender.com`
-
----
-
-## 🔗 Step 4: Wire Render Log Streams to Your Webhook
-
-Now point your main Render application's logs to this webhook:
-
-1. In the [Render Dashboard](https://dashboard.render.com), go to **Integrations** $\rightarrow$ **Observability** (or click your main application service $\rightarrow$ **Settings** $\rightarrow$ **Log Streams**).
-2. Locate **Log Streams** $\rightarrow$ Click **Add Log Stream** (or **Edit** default destination).
-3. Set the fields:
+### Step 2: Configure Render Log Stream for VeloTest
+1. In the Render Dashboard, open your **VeloTest** service (or go to **Workspace Settings** $\rightarrow$ **Integrations** $\rightarrow$ **Observability**).
+2. Scroll to the **Log Streams** section and click **Add Log Stream** (or **Edit**):
+   - **Destination**: `HTTPS`
    - **Log Endpoint**: 
      ```
-     https://your-webhook-service.onrender.com/webhook/render-logs
+     https://velotest-otp-agent.onrender.com/webhook/render-logs
      ```
-   - **Token**: If you set `WEBHOOK_SECRET` in `.env`, paste that exact string here. Otherwise leave empty.
-4. Click **Save Changes**.
-
----
-
-## 🔍 How Log Parsing Works
-
-Whenever your backend logs an OTP message, such as:
-```python
-print(f"OTP sent to {user_email}: {otp_code}")
-```
-or
-```python
-logger.info(f"Verification code for {user_email} is {otp_code}")
-```
-
-Render immediately streams this log line over HTTPS POST to `/webhook/render-logs`.
-
-The webhook:
-1. Validates the authorization token (if configured).
-2. Extracts `user@example.com` and `593821` using multi-pattern regex.
-3. Checks the in-memory cache to guarantee no duplicate emails are sent if Render retries a packet.
-4. Responds `200 OK` in $< 10\text{ms}$ so Render never experiences webhook timeouts.
-5. In the background task, establishes a secure SSL connection to `smtp.gmail.com:465` and delivers a clean HTML card with the OTP directly to the user!
+   - **Token**: *(Optional)* Enter a secret token matching `WEBHOOK_SECRET` in `.env`.
+3. Click **Save Changes**.
 
 ---
 
 ## 💡 Keeping Free Render Web Services Awake
 
-Render's free web services sleep after 15 minutes of inactivity:
-- Because Render Log Streams continuously pushes log activity to this endpoint whenever your main app receives traffic, it naturally stays awake!
-- To guarantee 100% 24/7 instant response even during off-peak hours, you can add a free ping monitor (e.g. [UptimeRobot](https://uptimerobot.com) or [Cron-job.org](https://cron-job.org)) that pings `https://your-webhook-service.onrender.com/healthz` every 10 minutes.
+Render free web services enter sleep mode after 15 minutes of inactivity:
+- Whenever candidates interact with VeloTest, Render streams the logs to this endpoint, keeping it active.
+- To ensure zero cold-start delay during off-peak hours, set up a free 10-minute ping monitor (via [UptimeRobot](https://uptimerobot.com) or [Cron-job.org](https://cron-job.org)) targeting:
+  `https://velotest-otp-agent.onrender.com/healthz`
