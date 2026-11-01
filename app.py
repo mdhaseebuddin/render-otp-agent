@@ -484,23 +484,14 @@ app = FastAPI(
 
 
 @app.get("/")
-def root():
-    """Root info endpoint reporting service status and configured providers."""
-    return {
-        "status": "online",
-        "service": "VeloTest Render OTP Webhook Agent",
-        "version": "2.1.0",
-        "webhook_endpoint": "/webhook/render-logs",
-        "provider_configured": "brevo" if BREVO_API_KEY else ("gmail_smtp" if (EMAIL_USER and EMAIL_PASS) else "none"),
-        "brevo_enabled": bool(BREVO_API_KEY),
-        "gmail_smtp_enabled": bool(EMAIL_USER and EMAIL_PASS)
-    }
-
-
+@app.head("/")
+@app.get("/health")
+@app.head("/health")
 @app.get("/healthz")
-def healthz():
-    """Health check endpoint for Render service uptime monitoring."""
-    return {"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()}
+@app.head("/healthz")
+def health_check():
+    """Dedicated health check endpoint supporting GET and HEAD for uptime monitoring."""
+    return {"status": "ok", "service": "render-otp-agent"}
 
 
 @app.post("/webhook/render-logs")
