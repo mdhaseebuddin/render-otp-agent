@@ -1,29 +1,24 @@
 #!/usr/bin/env python3
 """
-Render Real-Time OTP Webhook Receiver & Email Dispatcher for VeloTest
+Render Real-Time OTP Webhook Receiver & Brevo HTTPS Email Dispatcher
 =====================================================================
 A high-performance, asynchronous FastAPI application that receives real-time
 log streams from Render via HTTPS Webhook / Log Drain, dynamically extracts
-the target user's email address and OTP code from VeloTest platform logs, and
-dispatches an email immediately via Brevo API or Gmail SMTP SSL.
+the target user's email address and OTP code, and dispatches verification
+emails exclusively over HTTPS REST API (Port 443) using Brevo v3.
 
-Seamlessly accommodates VeloTest without requiring any changes to VeloTest itself.
-Runs 100% free on Render's Web Service free tier.
+Bypasses all outbound raw SMTP port blocks (465/587) on Render Free Tier.
 """
 
 import os
 import re
-import ssl
 import gzip
 import json
 import time
 import logging
-import urllib.request
-import urllib.error
 from typing import Optional, Tuple, List, Dict, Any
 from datetime import datetime, timezone
-import smtplib
-from email.message import EmailMessage
+import requests
 
 from fastapi import FastAPI, Request, BackgroundTasks, HTTPException, Header, status
 from fastapi.responses import JSONResponse
@@ -46,29 +41,39 @@ logging.basicConfig(
 logger = logging.getLogger("velotest_otp_webhook")
 
 # ==========================================
-# CONFIGURATION
+# CONFIGURATION & CONSTANTS
 # ==========================================
-# Dispatch provider: 'auto', 'brevo', or 'gmail' / 'smtp'
-EMAIL_PROVIDER = os.getenv("EMAIL_PROVIDER", "auto").strip().lower()
-
-# Brevo (Sendinblue) REST API Credentials
-BREVO_API_KEY = os.getenv("BREVO_API_KEY", "").strip()
-BREVO_SENDER_EMAIL = os.getenv("BREVO_SENDER_EMAIL", "").strip() or os.getenv("EMAIL_USER", "").strip()
-BREVO_SENDER_NAME = os.getenv("BREVO_SENDER_NAME", "").strip() or os.getenv("APP_NAME", "VeloTest Verification").strip()
-
-# Gmail / SMTP SSL Credentials
-EMAIL_USER = os.getenv("EMAIL_USER", "").strip()
-EMAIL_PASS = os.getenv("EMAIL_PASS", "").strip()
-SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com").strip()
-SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
+BREVO_API_URL = "https://api.brevo.com/v3/smtp/email"
 
 # Webhook Security & App Settings
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
-APP_NAME = os.getenv("APP_NAME", "VeloTest Verification").strip()
-DEDUP_CACHE_TTL = int(os.getenv("DEDUP_CACHE_TTL", "300"))
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip()
+APP_NAME = os.environ.get("APP_NAME", "VeloTest Security").strip()
+DEDUP_CACHE_TTL = int(os.environ.get("DEDUP_CACHE_TTL", "300"))
 
 # In-memory deduplication store: {(email, otp): timestamp}
 _recent_dispatches: Dict[Tuple[str, str], float] = {}
+
+
+def get_brevo_api_key() -> str:
+    """Retrieve Brevo API key from primary or secondary environment variable."""
+    return (
+        os.environ.get("BREVO_API_KEY", "").strip()
+        or os.environ.get("BREVO_API_KEY_FALLBACK", "").strip()
+        or os.environ.get("BREVO_KEY", "").strip()
+        or os.environ.get("SENDINBLUE_API_KEY", "").strip()
+    )
+
+
+def get_sender() -> dict:
+    """Retrieve sender configuration with environment variable overrides."""
+    sender_email = (
+        os.environ.get("SENDER_EMAIL", "").strip()
+        or os.environ.get("BREVO_SENDER_EMAIL", "").strip()
+        or "mdhaseebuddin24@gmail.com"
+    )
+    sender_name = os.environ.get("SENDER_NAME", "").strip() or "VeloTest Security"
+    return {"name": sender_name, "email": sender_email}
+
 
 # ==========================================
 # REGEX PATTERNS FOR EMAIL & OTP
@@ -78,31 +83,17 @@ EMAIL_REGEX = re.compile(
     re.IGNORECASE
 )
 
-# Pattern 1: Email then OTP
-# Matches:
-#   "OTP sent to user@example.com: 593821"
-#   "Verification code for student@velotest.com is 123456"
-#   "OTP for user@example.com: 123456"
-#   "candidate user@example.com OTP: 123456"
+# Pattern 1: Email then OTP ("OTP sent to user@example.com: 593821")
 PATTERN_EMAIL_THEN_OTP = re.compile(
     r"(?i)\b(?:otp|verification(?:\s*code)?|security\s*code|auth(?:entication)?\s*code|login\s*code|passcode|token|pin|code)\s*(?:sent\s*to|for|to|user|student|candidate)?\s*[:=]?\s*([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)[^\d\n\r]{1,35}?([0-9]{4,8})\b"
 )
 
-# Pattern 2: OTP then Email
-# Matches:
-#   "Sent OTP 593821 to user@example.com"
-#   "Generated OTP 123456 for candidate user@example.com"
-#   "[VeloTest] OTP: 123456 sent to user@example.com"
-#   "Code 123456 generated for student@test.org"
+# Pattern 2: OTP then Email ("Sent OTP 593821 to user@example.com")
 PATTERN_OTP_THEN_EMAIL = re.compile(
     r"(?i)\b(?:otp|verification(?:\s*code)?|security\s*code|auth(?:entication)?\s*code|login\s*code|passcode|token|pin|code)\s*(?:is|:|=|-)?\s*([0-9]{4,8})[^\n\r]*?\b(?:to|for|user|student|candidate|email)\s*[:=]?\s*([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)\b"
 )
 
-# Pattern 3: Key-Value / Structured format
-# Matches:
-#   "user: user@example.com | otp: 123456"
-#   "email: user@example.com, code: 123456"
-#   "student: user@example.com - pin: 1234"
+# Pattern 3: Key-Value structured format ("user: user@example.com | otp: 123456")
 PATTERN_KV_EMAIL_OTP = re.compile(
     r"(?i)\b(?:user|email|student|candidate|recipient|to)\s*[:=]\s*['\"]?([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)['\"]?[^\n\r]*?\b(?:otp|code|verification|passcode|pin|token)\s*[:=]\s*['\"]?([0-9]{4,8})['\"]?\b"
 )
@@ -113,7 +104,7 @@ PATTERN_STANDALONE_OTP = re.compile(
 )
 
 # Optional user-defined custom regex override
-CUSTOM_REGEX = os.getenv("OTP_CUSTOM_REGEX", "").strip()
+CUSTOM_REGEX = os.environ.get("OTP_CUSTOM_REGEX", "").strip()
 COMPILED_CUSTOM_REGEX = re.compile(CUSTOM_REGEX, re.IGNORECASE) if CUSTOM_REGEX else None
 
 
@@ -131,23 +122,20 @@ def parse_log_for_email_and_otp(message: str) -> Optional[Tuple[str, str]]:
 
     cleaned_msg = message.strip()
 
-    # 1. Check if the message is or contains an embedded JSON object
+    # 1. Embedded JSON inspection
     if "{" in cleaned_msg and "}" in cleaned_msg:
         try:
-            # Extract JSON substring
             start_idx = cleaned_msg.find("{")
             end_idx = cleaned_msg.rfind("}") + 1
             json_str = cleaned_msg[start_idx:end_idx]
             data = json.loads(json_str)
             if isinstance(data, dict):
-                # Look for common email keys
                 email_val = None
                 for ek in ("email", "user", "student", "candidate", "recipient", "to", "user_email", "student_email"):
                     if ek in data and isinstance(data[ek], str) and "@" in data[ek]:
                         email_val = data[ek].strip()
                         break
 
-                # Look for common OTP keys
                 otp_val = None
                 for ok in ("otp", "code", "verification_code", "verificationCode", "passcode", "pin", "token", "password"):
                     if ok in data:
@@ -172,26 +160,25 @@ def parse_log_for_email_and_otp(message: str) -> Optional[Tuple[str, str]]:
                 g1, g2 = custom_match.group(1).strip(), custom_match.group(2).strip()
                 return (g1, g2) if "@" in g1 else (g2, g1)
 
-    # 3. Check Pattern: Email then OTP ("OTP sent to user@example.com: 593821")
+    # 3. Check Pattern: Email then OTP
     match = PATTERN_EMAIL_THEN_OTP.search(cleaned_msg)
     if match:
         email, otp = match.group(1).strip(), match.group(2).strip()
         return email, otp
 
-    # 4. Check Pattern: OTP then Email ("Sent OTP 593821 to user@example.com")
+    # 4. Check Pattern: OTP then Email
     match = PATTERN_OTP_THEN_EMAIL.search(cleaned_msg)
     if match:
         otp, email = match.group(1).strip(), match.group(2).strip()
         return email, otp
 
-    # 5. Check Pattern: Structured Key-Value ("user: user@example.com | otp: 123456")
+    # 5. Check Pattern: Structured Key-Value
     match = PATTERN_KV_EMAIL_OTP.search(cleaned_msg)
     if match:
         email, otp = match.group(1).strip(), match.group(2).strip()
         return email, otp
 
-    # 6. Universal Heuristic Fallback for VeloTest logs:
-    # If the log contains an email and OTP/auth keywords, extract the email and code
+    # 6. Universal Heuristic Fallback
     lower_msg = cleaned_msg.lower()
     otp_indicators = (
         "otp", "verification", "verify", "auth", "login",
@@ -201,15 +188,12 @@ def parse_log_for_email_and_otp(message: str) -> Optional[Tuple[str, str]]:
         email_match = EMAIL_REGEX.search(cleaned_msg)
         if email_match:
             candidate_email = email_match.group(0).strip()
-            # Try to match specifically labeled OTP
             otp_match = PATTERN_STANDALONE_OTP.search(cleaned_msg)
             if otp_match:
                 return candidate_email, otp_match.group(1).strip()
-            # Fall back to any 4 to 8 digit integer not part of the email
             msg_without_email = cleaned_msg.replace(candidate_email, "")
             digits = re.findall(r"\b[0-9]{4,8}\b", msg_without_email)
             if digits:
-                # Prefer the last number (standard format: "User requested OTP ... 123456")
                 return candidate_email, digits[-1].strip()
 
     return None
@@ -235,131 +219,19 @@ def is_duplicate(email: str, otp: str) -> bool:
 
 
 # ==========================================
-# EMAIL DISPATCH SERVICES (BREVO & GMAIL)
+# BREVO HTTPS REST EMAIL DISPATCHER
 # ==========================================
-def dispatch_via_brevo(
-    recipient_email: str,
-    otp_code: str,
-    subject: str,
-    text_content: str,
-    html_content: str
-) -> bool:
+def generate_otp_html(otp_code: str) -> str:
     """
-    Dispatch transactional email via Brevo REST API (https://api.brevo.com/v3/smtp/email).
-    Lightweight, fast, and does not require SMTP port access.
+    Generate clean, responsive HTML email containing the OTP code
+    and a prominent 2-minute validity note.
     """
-    sender_email = BREVO_SENDER_EMAIL or EMAIL_USER
-    if not BREVO_API_KEY or not sender_email:
-        logger.error("Brevo dispatch failed: BREVO_API_KEY or sender email is missing!")
-        return False
-
-    payload = {
-        "sender": {
-            "name": BREVO_SENDER_NAME,
-            "email": sender_email
-        },
-        "to": [
-            {"email": recipient_email}
-        ],
-        "subject": subject,
-        "htmlContent": html_content,
-        "textContent": text_content
-    }
-
-    req = urllib.request.Request(
-        url="https://api.brevo.com/v3/smtp/email",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "api-key": BREVO_API_KEY,
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": "VeloTest-Render-OTP-Agent/2.0"
-        },
-        method="POST"
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=15) as res:
-            if res.getcode() in (200, 201, 202):
-                logger.info(f"✅ [Brevo API] Successfully delivered OTP [{otp_code}] to {recipient_email}")
-                return True
-            else:
-                body = res.read().decode("utf-8")
-                logger.error(f"❌ [Brevo API] HTTP {res.getcode()}: {body}")
-                return False
-    except urllib.error.HTTPError as e:
-        err_body = e.read().decode("utf-8", errors="replace")
-        logger.error(f"❌ [Brevo API] HTTP {e.code} error: {err_body}")
-        return False
-    except Exception as e:
-        logger.error(f"❌ [Brevo API] Network error: {e}")
-        return False
-
-
-def dispatch_via_gmail_smtp(
-    recipient_email: str,
-    otp_code: str,
-    subject: str,
-    text_content: str,
-    html_content: str
-) -> bool:
-    """
-    Dispatch email using smtplib SSL (port 465) via Gmail or custom SMTP server.
-    """
-    if not EMAIL_USER or not EMAIL_PASS:
-        logger.error("Gmail SMTP dispatch failed: EMAIL_USER or EMAIL_PASS not configured in .env!")
-        return False
-
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = f"{APP_NAME} <{EMAIL_USER}>"
-    msg["To"] = recipient_email
-    msg.set_content(text_content)
-    msg.add_alternative(html_content, subtype="html")
-
-    try:
-        context = ssl.create_default_context()
-        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context, timeout=20) as server:
-            server.login(EMAIL_USER, EMAIL_PASS)
-            server.send_message(msg)
-        logger.info(f"✅ [Gmail SMTP] Successfully delivered OTP [{otp_code}] to {recipient_email}")
-        return True
-    except Exception as e:
-        logger.error(f"❌ [Gmail SMTP] Error dispatching to {recipient_email}: {e}")
-        return False
-
-
-def dispatch_otp_email(
-    recipient_email: str,
-    otp_code: str,
-    log_timestamp: str = "",
-    log_message: str = ""
-):
-    """
-    Unified dispatcher: Selects Brevo API or Gmail SMTP based on environment configuration,
-    with automatic fallback support. Runs asynchronously in background.
-    """
-    formatted_time = log_timestamp or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    subject = f"🔐 Your VeloTest Verification Code: {otp_code}"
-
-    # Plain text fallback body
-    text_content = (
-        f"Hello,\n\n"
-        f"Your VeloTest verification code is: {otp_code}\n\n"
-        f"Generated at: {formatted_time}\n"
-        f"Please enter this code on the VeloTest platform to continue.\n"
-        f"If you did not request this verification code, please ignore this email.\n\n"
-        f"Best regards,\n"
-        f"{APP_NAME} Team\n"
-    )
-
-    # Modern, responsive HTML Card
-    html_content = f"""<!DOCTYPE html>
+    return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>VeloTest Verification Code</title>
+  <title>Your Verification Code</title>
   <style>
     body {{
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
@@ -416,15 +288,15 @@ def dispatch_otp_email(
       font-family: 'Courier New', Courier, monospace;
       margin: 0;
     }}
-    .security-notice {{
-      background-color: #fffbeb;
+    .validity-notice {{
+      background-color: #fef3c7;
       border-left: 4px solid #f59e0b;
       padding: 12px 16px;
       border-radius: 4px;
       font-size: 13px;
       color: #92400e;
       margin-top: 24px;
-      line-height: 1.4;
+      line-height: 1.5;
     }}
     .footer {{
       text-align: center;
@@ -438,39 +310,120 @@ def dispatch_otp_email(
 </head>
 <body>
   <div class="container">
-    <div class="brand">VeloTest Platform</div>
+    <div class="brand">VeloTest Security</div>
     <h1 class="heading">Verification Code</h1>
-    <p class="instructions">Enter the one-time code below to complete verification.</p>
+    <p class="instructions">Please enter the one-time verification code below to complete your login.</p>
 
     <div class="otp-card">
       <div class="otp-number">{otp_code}</div>
     </div>
 
-    <div class="security-notice">
-      <strong>Security Notice:</strong> Never share this code with anyone. VeloTest staff and exam proctors will never ask for your verification code.
+    <div class="validity-notice">
+      ⏱️ <strong>Note:</strong> This verification code is valid for <strong>2 minutes</strong>. Never share this code with anyone. VeloTest staff and exam proctors will never ask for your verification code.
     </div>
 
     <div class="footer">
-      Generated at {formatted_time}<br>
-      Automated dispatch via VeloTest Render OTP Agent.
+      If you did not request this verification code, please ignore this email or secure your account.<br>
+      Automated dispatch via VeloTest Security.
     </div>
   </div>
 </body>
 </html>"""
 
-    # Provider Selection:
-    use_brevo = (EMAIL_PROVIDER == "brevo") or (EMAIL_PROVIDER == "auto" and bool(BREVO_API_KEY))
 
-    if use_brevo:
-        logger.info(f"🚀 Dispatching OTP [{otp_code}] to {recipient_email} via Brevo API...")
-        success = dispatch_via_brevo(recipient_email, otp_code, subject, text_content, html_content)
-        # Automatic fallback to Gmail SMTP if Brevo fails and SMTP credentials exist
-        if not success and EMAIL_USER and EMAIL_PASS:
-            logger.info("⚠️ Brevo failed; attempting automatic fallback to Gmail SMTP...")
-            dispatch_via_gmail_smtp(recipient_email, otp_code, subject, text_content, html_content)
-    else:
-        logger.info(f"🚀 Dispatching OTP [{otp_code}] to {recipient_email} via Gmail SMTP...")
-        dispatch_via_gmail_smtp(recipient_email, otp_code, subject, text_content, html_content)
+def dispatch_via_brevo(recipient_email: str, otp_code: str) -> dict:
+    """
+    Dispatch transactional email via Brevo REST API (HTTPS port 443).
+    Logs the Brevo response and returns a structured response dict with HTTP status.
+    """
+    brevo_api_key = get_brevo_api_key()
+    if not brevo_api_key:
+        error_msg = "Brevo dispatch failed: BREVO_API_KEY is not configured in environment variables!"
+        logger.error(error_msg)
+        return {"status_code": 500, "success": False, "error": error_msg}
+
+    sender = get_sender()
+    html_content = generate_otp_html(otp_code)
+
+    headers = {
+        "accept": "application/json",
+        "api-key": brevo_api_key,
+        "content-type": "application/json"
+    }
+
+    payload = {
+        "sender": sender,
+        "to": [{"email": recipient_email}],
+        "subject": "Your Verification Code",
+        "htmlContent": html_content
+    }
+
+    try:
+        response = requests.post(
+            BREVO_API_URL,
+            headers=headers,
+            json=payload,
+            timeout=15
+        )
+
+        try:
+            resp_json = response.json()
+        except Exception:
+            resp_json = {"raw": response.text}
+
+        logger.info(
+            f"Brevo API Response Status: {response.status_code} | Output: {json.dumps(resp_json)}"
+        )
+
+        if response.status_code in (200, 201, 202):
+            logger.info(f"✅ Successfully delivered OTP [{otp_code}] to {recipient_email} via Brevo API")
+            return {
+                "status_code": 200,
+                "success": True,
+                "brevo_status": response.status_code,
+                "response": resp_json
+            }
+        else:
+            error_msg = f"Brevo API error (HTTP {response.status_code}): {resp_json}"
+            logger.error(f"❌ {error_msg}")
+            return {
+                "status_code": 500,
+                "success": False,
+                "error": error_msg,
+                "brevo_status": response.status_code,
+                "response": resp_json
+            }
+
+    except requests.exceptions.RequestException as e:
+        error_msg = f"Network exception connecting to Brevo API: {str(e)}"
+        logger.error(f"❌ {error_msg}")
+        return {
+            "status_code": 500,
+            "success": False,
+            "error": error_msg
+        }
+    except Exception as e:
+        error_msg = f"Unexpected error during Brevo dispatch: {str(e)}"
+        logger.error(f"❌ {error_msg}")
+        return {
+            "status_code": 500,
+            "success": False,
+            "error": error_msg
+        }
+
+
+def dispatch_otp_email(
+    recipient_email: str,
+    otp_code: str,
+    log_timestamp: str = "",
+    log_message: str = ""
+) -> dict:
+    """
+    Background worker function to dispatch OTP via Brevo HTTPS REST API.
+    Does not crash on failure and logs exact response details.
+    """
+    logger.info(f"🚀 Dispatching OTP [{otp_code}] to {recipient_email} via Brevo HTTPS API...")
+    return dispatch_via_brevo(recipient_email=recipient_email, otp_code=otp_code)
 
 
 # ==========================================
@@ -478,11 +431,12 @@ def dispatch_otp_email(
 # ==========================================
 app = FastAPI(
     title="VeloTest Render Real-Time OTP Webhook Agent",
-    description="Sub-second OTP log parser and dynamic email dispatcher for VeloTest on Render",
-    version="2.1.0"
+    description="Sub-second OTP log parser and Brevo HTTPS email dispatcher for VeloTest on Render",
+    version="2.2.0"
 )
 
 
+# Dedicated Health Check routes supporting GET and HEAD
 @app.get("/")
 @app.head("/")
 @app.get("/health")
@@ -505,7 +459,7 @@ async def receive_render_logs(
     """
     Real-time webhook endpoint receiving log streams from Render Log Drain.
     Accepts JSON arrays, single log entries, NDJSON, and gzip compressed streams.
-    Extracts dynamic candidate/user emails & OTP codes, dispatching emails in the background.
+    Extracts dynamic candidate/user emails & OTP codes, dispatching emails over Brevo HTTPS.
     """
     # 1. Optional Webhook Authentication Token Check
     if WEBHOOK_SECRET:
@@ -616,32 +570,29 @@ async def receive_render_logs(
 
 
 # ==========================================
-# MANUAL SIMULATION / TEST ENDPOINT
+# MANUAL SIMULATION / TEST DISPATCH ENDPOINT
 # ==========================================
 @app.post("/test-send")
 async def test_send(
     email: str,
-    otp: str = "593821",
-    background_tasks: BackgroundTasks = BackgroundTasks()
+    otp: str = "593821"
 ):
     """
-    Test endpoint to simulate email dispatch directly.
-    Example: POST /test-send?email=student@example.com&otp=123456
+    Direct test endpoint to simulate and verify Brevo HTTPS email dispatch.
+    Returns HTTP 200 on success (Brevo 200, 201, 202) or HTTP 500 on failure without crashing.
+    Example: POST /test-send?email=candidate@example.com&otp=123456
     """
     if not email or "@" not in email:
         raise HTTPException(status_code=400, detail="Valid email query param is required")
 
-    background_tasks.add_task(
-        dispatch_otp_email,
-        recipient_email=email,
-        otp_code=otp,
-        log_timestamp=datetime.now(timezone.utc).isoformat(),
-        log_message=f"Manual VeloTest test trigger for {email}: {otp}"
-    )
-    return {"status": "queued", "email": email, "otp": otp}
+    result = dispatch_via_brevo(recipient_email=email, otp_code=otp)
+    if result.get("status_code") == 200:
+        return JSONResponse(status_code=status.HTTP_200_OK, content=result)
+    else:
+        return JSONResponse(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, content=result)
 
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", "8000"))
+    port = int(os.environ.get("PORT", "8000"))
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=True)

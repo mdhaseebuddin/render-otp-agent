@@ -12,16 +12,14 @@ Author: Antigravity Agent
 import os
 import sys
 import re
-import ssl
 import json
 import time
 import argparse
-import smtplib
 from datetime import datetime, timezone
 import urllib.request
 import urllib.error
 import urllib.parse
-from email.message import EmailMessage
+import requests
 
 # Load environment variables from .env file
 try:
@@ -245,81 +243,80 @@ def extract_otp(message: str) -> str:
 
 def send_otp_email(otp_code: str, log_message: str, log_timestamp: str):
     """
-    Send an email with the extracted OTP code to the recipient using Gmail SMTP SSL (port 465).
+    Send an email with the extracted OTP code to the recipient using Brevo HTTPS REST API (Port 443).
     """
-    print(f"[+] Preparing to send OTP ({otp_code}) via email to {RECIPIENT_EMAIL}...")
+    print(f"[+] Preparing to send OTP ({otp_code}) via Brevo HTTPS API to {RECIPIENT_EMAIL}...")
 
-    formatted_time = log_timestamp or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-    # Construct EmailMessage
-    msg = EmailMessage()
-    msg["Subject"] = f"🔐 Your OTP / Verification Code: {otp_code}"
-    msg["From"] = EMAIL_USER
-    msg["To"] = RECIPIENT_EMAIL
-
-    # Plaintext fallback body
-    text_content = (
-        f"Hello,\n\n"
-        f"A new OTP / verification code was detected in your Render service logs.\n\n"
-        f"OTP Code: {otp_code}\n"
-        f"Timestamp: {formatted_time}\n"
-        f"Service ID: {RENDER_SERVICE_ID}\n\n"
-        f"Log Excerpt:\n"
-        f"{log_message}\n\n"
-        f"---\n"
-        f"Sent automatically by Render OTP Agent.\n"
+    brevo_api_key = (
+        os.environ.get("BREVO_API_KEY", "").strip()
+        or os.environ.get("BREVO_API_KEY_FALLBACK", "").strip()
+        or os.environ.get("BREVO_KEY", "").strip()
+        or os.environ.get("SENDINBLUE_API_KEY", "").strip()
     )
-    msg.set_content(text_content)
 
-    # HTML body for clean, legible presentation
+    if not brevo_api_key:
+        print("[ERROR] BREVO_API_KEY not configured in environment!")
+        return
+
+    sender_email = (
+        os.environ.get("SENDER_EMAIL", "").strip()
+        or os.environ.get("BREVO_SENDER_EMAIL", "").strip()
+        or "mdhaseebuddin24@gmail.com"
+    )
+    sender_name = os.environ.get("SENDER_NAME", "").strip() or "VeloTest Security"
+
     html_content = f"""<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
   <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #f4f6f8; margin: 0; padding: 20px; }}
-    .card {{ max-width: 500px; margin: 20px auto; background: #ffffff; border-radius: 12px; padding: 32px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); border: 1px solid #e1e4e8; }}
-    .header {{ text-align: center; margin-bottom: 24px; }}
-    .title {{ font-size: 20px; color: #1a202c; font-weight: 700; margin: 0; }}
-    .subtitle {{ font-size: 13px; color: #718096; margin-top: 6px; }}
-    .otp-box {{ background: #f0fdf4; border: 2px dashed #22c55e; border-radius: 8px; padding: 18px; text-align: center; margin: 24px 0; }}
-    .otp-code {{ font-size: 36px; font-weight: 800; letter-spacing: 6px; color: #15803d; font-family: 'Courier New', Courier, monospace; margin: 0; }}
-    .details {{ background: #f8fafc; border-radius: 6px; padding: 14px; font-size: 13px; color: #475569; margin-top: 20px; }}
-    .details dt {{ font-weight: 600; color: #334155; margin-top: 6px; }}
-    .details dd {{ margin-left: 0; word-break: break-all; font-family: Consolas, monospace; }}
-    .footer {{ text-align: center; font-size: 11px; color: #94a3b8; margin-top: 24px; }}
+    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #f6f9fc; margin: 0; padding: 20px; }}
+    .card {{ max-width: 480px; margin: 20px auto; background: #ffffff; border-radius: 12px; padding: 32px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); border: 1px solid #e1e4e8; }}
+    .title {{ font-size: 20px; color: #1a202c; font-weight: 700; margin: 0; text-align: center; }}
+    .otp-box {{ background: #f0fdf4; border: 2px dashed #22c55e; border-radius: 8px; padding: 18px; text-align: center; margin: 20px 0; }}
+    .otp-code {{ font-size: 36px; font-weight: 800; letter-spacing: 6px; color: #15803d; font-family: monospace; margin: 0; }}
+    .notice {{ background-color: #fef3c7; border-left: 4px solid #f59e0b; padding: 12px 16px; border-radius: 4px; font-size: 13px; color: #92400e; margin-top: 20px; }}
+    .footer {{ text-align: center; font-size: 11px; color: #94a3b8; margin-top: 20px; }}
   </style>
 </head>
 <body>
   <div class="card">
-    <div class="header">
-      <h2 class="title">🔐 Verification Code Received</h2>
-      <p class="subtitle">Dispatched from Render Service: <code>{RENDER_SERVICE_ID}</code></p>
-    </div>
+    <h2 class="title">🔐 Your Verification Code</h2>
     <div class="otp-box">
       <div class="otp-code">{otp_code}</div>
     </div>
-    <div class="details">
-      <dt>Log Timestamp:</dt>
-      <dd>{formatted_time}</dd>
-      <dt>Raw Log Message:</dt>
-      <dd>{log_message}</dd>
+    <div class="notice">
+      ⏱️ <strong>Note:</strong> This verification code is valid for <strong>2 minutes</strong>. Never share this code with anyone.
     </div>
     <div class="footer">
-      This email was generated automatically by Render OTP Agent.
+      Automated dispatch via VeloTest Security.
     </div>
   </div>
 </body>
 </html>"""
-    msg.add_alternative(html_content, subtype="html")
 
-    # Connect securely via SSL on port 465
-    context = ssl.create_default_context()
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context, timeout=30) as server:
-        server.login(EMAIL_USER, EMAIL_PASS)
-        server.send_message(msg)
+    headers = {
+        "accept": "application/json",
+        "api-key": brevo_api_key,
+        "content-type": "application/json"
+    }
 
-    print(f"[SUCCESS] OTP email successfully delivered to {RECIPIENT_EMAIL}!")
+    payload = {
+        "sender": {"name": sender_name, "email": sender_email},
+        "to": [{"email": RECIPIENT_EMAIL}],
+        "subject": "Your Verification Code",
+        "htmlContent": html_content
+    }
+
+    try:
+        res = requests.post("https://api.brevo.com/v3/smtp/email", headers=headers, json=payload, timeout=15)
+        print(f"[+] Brevo API Status: {res.status_code} | Body: {res.text}")
+        if res.status_code in (200, 201, 202):
+            print(f"[SUCCESS] OTP email successfully delivered to {RECIPIENT_EMAIL}!")
+        else:
+            print(f"[ERROR] Failed to send email via Brevo API: {res.text}")
+    except Exception as e:
+        print(f"[ERROR] Exception during Brevo API request: {e}")
 
 
 # ==========================================

@@ -1,8 +1,17 @@
 # ⚡ VeloTest Real-Time OTP Webhook Agent
 
-A dedicated, high-performance **FastAPI** webhook log receiver and email dispatcher engineered to seamlessly accommodate the **VeloTest** platform on [Render](https://render.com) **with zero modifications required in VeloTest**.
+A dedicated, high-performance **FastAPI** webhook log receiver and email dispatcher engineered for **VeloTest** on [Render](https://render.com) **with zero modifications required in VeloTest**.
 
-Whenever VeloTest generates or logs an OTP verification code, Render's native **Log Streams (Log Drains)** immediately forward the log line to this service over HTTPS. The agent extracts both the **target candidate/user email** and the **OTP code**, then delivers a branded verification email via **Brevo REST API** or **Gmail SMTP SSL (port 465)**.
+Whenever VeloTest generates or logs an OTP verification code, Render's native **Log Streams (Log Drains)** immediately forward the log line to this service over HTTPS. The agent extracts both the **target candidate/user email** and the **OTP code**, then delivers a branded verification email over **Brevo HTTPS REST API (Port 443)**.
+
+---
+
+## 🚫 Why Pure HTTPS REST API (Port 443)?
+
+> [!IMPORTANT]
+> **Render blocks raw outbound SMTP ports (465, 587, 25)** on all Free Tier instances, producing `[Errno 101] Network is unreachable` when attempting to connect to `smtp.gmail.com`.
+>
+> To bypass this restriction completely, this service transmits all emails via **Brevo's v3 REST API (`POST https://api.brevo.com/v3/smtp/email`) over standard HTTPS (Port 443)**. Outbound HTTPS traffic is 100% permitted and uninterrupted on Render's Free Tier.
 
 ---
 
@@ -32,16 +41,14 @@ Whenever VeloTest generates or logs an OTP verification code, Render's native **
                         ▼ (Non-blocking Background Task)
          ┌──────────────┴──────────────┐
          ▼                             ▼
-   [Brevo REST API]            [Gmail SMTP SSL 465]
- (api.brevo.com/v3/smtp/email)    (smtp.gmail.com:465)
-         │                             │
-         └──────────────┬──────────────┘
-                        │
-                        ▼
-         ┌─────────────────────────────┐
-         │     Candidate's Inbox       │
-         │   (Branded HTML OTP Card)   │
-         └─────────────────────────────┘
+   [Brevo v3 REST API]        [Port 443 HTTPS Request]
+ (https://api.brevo.com/v3/smtp/email)
+         │
+         ▼
+ ┌─────────────────────────────┐
+ │     Candidate's Inbox       │
+ │   (Branded HTML OTP Card)   │
+ └─────────────────────────────┘
 ```
 
 ---
@@ -59,36 +66,28 @@ The parser automatically recognizes all standard and custom formats produced by 
 | **JSON Log** | `{"service": "velotest", "email": "alice@velotest.io", "otp": "993821"}` | `alice@velotest.io` | `993821` |
 | **Colon Style** | `OTP for student@velotest.com: 654321` | `student@velotest.com` | `654321` |
 
-*Need a unique pattern? Set `OTP_CUSTOM_REGEX` in `.env` to override at any time.*
-
 ---
 
 ## ⚙️ Environment Configuration (`.env`)
 
-Configure either **Brevo API** (recommended for production volume) or **Gmail SMTP**:
+Configure your Brevo API key and sender email in `.env`:
 
 ```env
-# 1. Provider Selection: 'auto', 'brevo', or 'gmail'
-# 'auto' prioritizes Brevo if BREVO_API_KEY is present, else falls back to Gmail SMTP
-EMAIL_PROVIDER=auto
-
-# 2. Option A: Brevo (Sendinblue) API Credentials
+# 1. Brevo HTTPS REST API Credentials (Port 443)
+# Get your API key from: https://app.brevo.com/settings/keys/api
 BREVO_API_KEY=xkeysib-your_brevo_api_key_here
-BREVO_SENDER_EMAIL=no-reply@yourdomain.com
-BREVO_SENDER_NAME=VeloTest Verification
+BREVO_API_KEY_FALLBACK=
 
-# 3. Option B: Gmail SMTP Credentials
-EMAIL_USER=velotest2026@gmail.com
-EMAIL_PASS=your_16_char_gmail_app_password
-SMTP_HOST=smtp.gmail.com
-SMTP_PORT=465
+# Sender Details (Must be a verified sender in your Brevo account)
+SENDER_EMAIL=mdhaseebuddin24@gmail.com
+SENDER_NAME=VeloTest Security
 
-# 4. Webhook Security (Optional)
-# If you set a token in Render's Log Stream configuration, place it here:
+# 2. Webhook Security (Optional)
+# Matches the Token set in Render Log Streams configuration (leave empty for none)
 WEBHOOK_SECRET=
 
-# 5. App Settings
-APP_NAME=VeloTest Verification
+# 3. App Settings
+APP_NAME=VeloTest Security
 DEDUP_CACHE_TTL=300
 PORT=8000
 ```
@@ -97,15 +96,12 @@ PORT=8000
 
 ## 🧪 Local Verification & Testing
 
-Before deploying, you can test everything on your machine:
-
 ### 1. Install Dependencies
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. Run the Parser Unit Tests
-Verifies all VeloTest formats against regex & deduplication:
+### 2. Run Parser Unit Tests
 ```bash
 python test_webhook.py
 ```
@@ -115,25 +111,22 @@ python test_webhook.py
 uvicorn app:app --reload --port 8000
 ```
 
-### 4. Run the Local Simulator (Sends real test email)
-In another terminal, simulate Render pushing a VeloTest log:
+### 4. Direct Test Dispatch via Brevo API
+You can test sending a verification email directly to your inbox:
 ```bash
-python test_local.py --email your_email@gmail.com --format standard
+# Using curl:
+curl -X POST "http://localhost:8000/test-send?email=your_email@gmail.com&otp=593821"
 ```
-Other test formats available:
+Or run the simulated webhook test:
 ```bash
-python test_local.py --email your_email@gmail.com --format velotest_bracket
-python test_local.py --email your_email@gmail.com --format json
+python test_local.py --email your_email@gmail.com
 ```
-Check your inbox to verify the arrival of the branded VeloTest verification card.
 
 ---
 
 ## 🚀 Mapping Render's Log Streams to VeloTest
 
-Once you deploy this agent as a free web service on Render, wire it to your existing VeloTest deployment in under 60 seconds:
-
-### Step 1: Deploy `render-otp-agent` on Render
+### Step 1: Deploy on Render
 1. Push this repository to GitHub/GitLab.
 2. In [Render Dashboard](https://dashboard.render.com), click **New +** $\rightarrow$ **Web Service**.
 3. Select this repository:
@@ -142,25 +135,20 @@ Once you deploy this agent as a free web service on Render, wire it to your exis
    - **Start Command**: `uvicorn app:app --host 0.0.0.0 --port $PORT`
    - **Plan**: **Free**
    - **Health Check Path**: `/healthz`
-4. Add your `.env` variables (`BREVO_API_KEY` or `EMAIL_USER` / `EMAIL_PASS`).
+4. Add environment variables:
+   - `BREVO_API_KEY`: Your Brevo API key (`xkeysib-...`)
+   - `SENDER_EMAIL`: `mdhaseebuddin24@gmail.com` (or your verified Brevo sender)
 5. Copy your deployed service URL (e.g., `https://velotest-otp-agent.onrender.com`).
 
 ### Step 2: Configure Render Log Stream for VeloTest
-1. In the Render Dashboard, open your **VeloTest** service (or go to **Workspace Settings** $\rightarrow$ **Integrations** $\rightarrow$ **Observability**).
-2. Scroll to the **Log Streams** section and click **Add Log Stream** (or **Edit**):
+1. In the Render Dashboard, open your **VeloTest** service $\rightarrow$ **Settings** $\rightarrow$ **Log Streams**.
+2. Click **Add Log Stream**:
    - **Destination**: `HTTPS`
    - **Log Endpoint**: 
      ```
      https://velotest-otp-agent.onrender.com/webhook/render-logs
      ```
-   - **Token**: *(Optional)* Enter a secret token matching `WEBHOOK_SECRET` in `.env`.
+   - **Token**: *(Optional)* Enter a token matching `WEBHOOK_SECRET` in `.env`.
 3. Click **Save Changes**.
 
----
-
-## 💡 Keeping Free Render Web Services Awake
-
-Render free web services enter sleep mode after 15 minutes of inactivity:
-- Whenever candidates interact with VeloTest, Render streams the logs to this endpoint, keeping it active.
-- To ensure zero cold-start delay during off-peak hours, set up a free 10-minute ping monitor (via [UptimeRobot](https://uptimerobot.com) or [Cron-job.org](https://cron-job.org)) targeting:
-  `https://velotest-otp-agent.onrender.com/healthz`
+Whenever VeloTest logs an OTP, Render streams it to this webhook, and Brevo immediately emails the user over HTTPS port 443 with sub-second latency!

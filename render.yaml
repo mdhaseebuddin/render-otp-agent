@@ -8,21 +8,17 @@ services:
     startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /healthz
     envVars:
-      - key: EMAIL_PROVIDER
-        value: auto
       - key: BREVO_API_KEY
         sync: false
-      - key: BREVO_SENDER_EMAIL
+      - key: BREVO_API_KEY_FALLBACK
         sync: false
-      - key: BREVO_SENDER_NAME
-        value: VeloTest Verification
-      - key: EMAIL_USER
-        sync: false
-      - key: EMAIL_PASS
-        sync: false
+      - key: SENDER_EMAIL
+        value: mdhaseebuddin24@gmail.com
+      - key: SENDER_NAME
+        value: VeloTest Security
       - key: WEBHOOK_SECRET
         sync: false
       - key: APP_NAME
-        value: VeloTest Verification
+        value: VeloTest Security
       - key: DEDUP_CACHE_TTL
         value: "300"
