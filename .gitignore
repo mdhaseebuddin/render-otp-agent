@@ -1,0 +1,4 @@
+
+.env
+generate_token.py
+__pycache__/
