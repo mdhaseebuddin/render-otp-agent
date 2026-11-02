@@ -4,7 +4,7 @@ VeloTest Local Webhook Tester for Render OTP Agent
 ===================================================
 Simulates authentic Render Log Streams webhook POST requests containing
 various VeloTest platform log formats to verify parsing, deduplication,
-and email dispatch (via Brevo API or Gmail SMTP) on your local server.
+and email dispatch via Google's official Gmail REST API.
 """
 
 import os
@@ -24,7 +24,7 @@ except ImportError:
 
 DEFAULT_SERVER_URL = "http://localhost:8000"
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
-DEFAULT_EMAIL = os.getenv("EMAIL_USER", "velotest2026@gmail.com").strip()
+DEFAULT_EMAIL = os.getenv("SENDER_EMAIL", "velotest2026@gmail.com").strip()
 
 
 def check_health(base_url: str) -> bool:
@@ -122,7 +122,7 @@ def send_simulated_webhook(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Simulate Render Log Streams for VeloTest OTP Agent"
+        description="Simulate Render Log Streams for VeloTest OTP Agent (Gmail REST API)"
     )
     parser.add_argument(
         "--url", "-u",
@@ -151,7 +151,7 @@ def main():
     target_email = args.email
 
     print("=================================================================")
-    print(" 🚀 VeloTest Render Webhook Local Simulator")
+    print(" 🚀 VeloTest Render Webhook Local Simulator (Gmail REST API)")
     print("=================================================================")
     print(f" Target Webhook  : {args.url.rstrip('/')}/webhook/render-logs")
     print(f" Recipient Email : {target_email}")

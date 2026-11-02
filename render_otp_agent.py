@@ -243,80 +243,15 @@ def extract_otp(message: str) -> str:
 
 def send_otp_email(otp_code: str, log_message: str, log_timestamp: str):
     """
-    Send an email with the extracted OTP code to the recipient using Brevo HTTPS REST API (Port 443).
+    Send an email with the extracted OTP code to the recipient using the official Gmail REST API.
     """
-    print(f"[+] Preparing to send OTP ({otp_code}) via Brevo HTTPS API to {RECIPIENT_EMAIL}...")
-
-    brevo_api_key = (
-        os.environ.get("BREVO_API_KEY", "").strip()
-        or os.environ.get("BREVO_API_KEY_FALLBACK", "").strip()
-        or os.environ.get("BREVO_KEY", "").strip()
-        or os.environ.get("SENDINBLUE_API_KEY", "").strip()
-    )
-
-    if not brevo_api_key:
-        print("[ERROR] BREVO_API_KEY not configured in environment!")
-        return
-
-    sender_email = (
-        os.environ.get("SENDER_EMAIL", "").strip()
-        or os.environ.get("BREVO_SENDER_EMAIL", "").strip()
-        or "mdhaseebuddin24@gmail.com"
-    )
-    sender_name = os.environ.get("SENDER_NAME", "").strip() or "VeloTest Security"
-
-    html_content = f"""<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #f6f9fc; margin: 0; padding: 20px; }}
-    .card {{ max-width: 480px; margin: 20px auto; background: #ffffff; border-radius: 12px; padding: 32px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); border: 1px solid #e1e4e8; }}
-    .title {{ font-size: 20px; color: #1a202c; font-weight: 700; margin: 0; text-align: center; }}
-    .otp-box {{ background: #f0fdf4; border: 2px dashed #22c55e; border-radius: 8px; padding: 18px; text-align: center; margin: 20px 0; }}
-    .otp-code {{ font-size: 36px; font-weight: 800; letter-spacing: 6px; color: #15803d; font-family: monospace; margin: 0; }}
-    .notice {{ background-color: #fef3c7; border-left: 4px solid #f59e0b; padding: 12px 16px; border-radius: 4px; font-size: 13px; color: #92400e; margin-top: 20px; }}
-    .footer {{ text-align: center; font-size: 11px; color: #94a3b8; margin-top: 20px; }}
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h2 class="title">🔐 Your Verification Code</h2>
-    <div class="otp-box">
-      <div class="otp-code">{otp_code}</div>
-    </div>
-    <div class="notice">
-      ⏱️ <strong>Note:</strong> This verification code is valid for <strong>2 minutes</strong>. Never share this code with anyone.
-    </div>
-    <div class="footer">
-      Automated dispatch via VeloTest Security.
-    </div>
-  </div>
-</body>
-</html>"""
-
-    headers = {
-        "accept": "application/json",
-        "api-key": brevo_api_key,
-        "content-type": "application/json"
-    }
-
-    payload = {
-        "sender": {"name": sender_name, "email": sender_email},
-        "to": [{"email": RECIPIENT_EMAIL}],
-        "subject": "Your Verification Code",
-        "htmlContent": html_content
-    }
-
+    print(f"[+] Preparing to send OTP ({otp_code}) via Gmail REST API to {RECIPIENT_EMAIL}...")
     try:
-        res = requests.post("https://api.brevo.com/v3/smtp/email", headers=headers, json=payload, timeout=15)
-        print(f"[+] Brevo API Status: {res.status_code} | Body: {res.text}")
-        if res.status_code in (200, 201, 202):
-            print(f"[SUCCESS] OTP email successfully delivered to {RECIPIENT_EMAIL}!")
-        else:
-            print(f"[ERROR] Failed to send email via Brevo API: {res.text}")
+        from app import dispatch_gmail_rest_email
+        res = dispatch_gmail_rest_email(recipient_email=RECIPIENT_EMAIL, otp_code=otp_code)
+        print(f"[SUCCESS] OTP email delivered to {RECIPIENT_EMAIL}! Message ID: {res.get('id')}")
     except Exception as e:
-        print(f"[ERROR] Exception during Brevo API request: {e}")
+        print(f"[ERROR] Gmail API dispatch failed: {e}")
 
 
 # ==========================================

@@ -8,17 +8,17 @@ services:
     startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /healthz
     envVars:
-      - key: BREVO_API_KEY
+      - key: GMAIL_CLIENT_ID
         sync: false
-      - key: BREVO_API_KEY_FALLBACK
+      - key: GMAIL_CLIENT_SECRET
+        sync: false
+      - key: GMAIL_REFRESH_TOKEN
         sync: false
       - key: SENDER_EMAIL
-        value: mdhaseebuddin24@gmail.com
-      - key: SENDER_NAME
-        value: VeloTest Security
+        value: velotest2026@gmail.com
       - key: WEBHOOK_SECRET
         sync: false
       - key: APP_NAME
-        value: VeloTest Security
+        value: VeloTest
       - key: DEDUP_CACHE_TTL
         value: "300"

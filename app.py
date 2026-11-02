@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Render Real-Time OTP Webhook Receiver & Brevo HTTPS Email Dispatcher
-=====================================================================
-A high-performance, asynchronous FastAPI application that receives real-time
-log streams from Render via HTTPS Webhook / Log Drain, dynamically extracts
-the target user's email address and OTP code, and dispatches verification
-emails exclusively over HTTPS REST API (Port 443) using Brevo v3.
+Render Real-Time OTP Webhook Receiver & Gmail REST API Dispatcher
+=================================================================
+A high-performance FastAPI application that receives real-time log streams
+from Render via HTTPS Webhook / Log Drain, dynamically extracts the target
+user's email address and OTP code, and dispatches verification emails
+exclusively via the official Google Gmail REST API over HTTPS (Port 443).
 
-Bypasses all outbound raw SMTP port blocks (465/587) on Render Free Tier.
+Completely bypasses raw SMTP ports (465/587) using OAuth2 access token refresh.
 """
 
 import os
@@ -15,11 +15,13 @@ import re
 import gzip
 import json
 import time
+import base64
 import logging
 from typing import Optional, Tuple, List, Dict, Any
 from datetime import datetime, timezone
-import requests
+from email.message import EmailMessage
 
+import requests
 from fastapi import FastAPI, Request, BackgroundTasks, HTTPException, Header, status
 from fastapi.responses import JSONResponse
 
@@ -43,189 +45,88 @@ logger = logging.getLogger("velotest_otp_webhook")
 # ==========================================
 # CONFIGURATION & CONSTANTS
 # ==========================================
-BREVO_API_URL = "https://api.brevo.com/v3/smtp/email"
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GMAIL_SEND_URL = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"
 
-# Webhook Security & App Settings
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip()
-APP_NAME = os.environ.get("APP_NAME", "VeloTest Security").strip()
+APP_NAME = os.environ.get("APP_NAME", "VeloTest").strip()
 DEDUP_CACHE_TTL = int(os.environ.get("DEDUP_CACHE_TTL", "300"))
 
 # In-memory deduplication store: {(email, otp): timestamp}
 _recent_dispatches: Dict[Tuple[str, str], float] = {}
 
-
-def get_brevo_api_key() -> str:
-    """Retrieve Brevo API key from primary or secondary environment variable."""
-    return (
-        os.environ.get("BREVO_API_KEY", "").strip()
-        or os.environ.get("BREVO_API_KEY_FALLBACK", "").strip()
-        or os.environ.get("BREVO_KEY", "").strip()
-        or os.environ.get("SENDINBLUE_API_KEY", "").strip()
-    )
-
-
-def get_sender() -> dict:
-    """Retrieve sender configuration with environment variable overrides."""
-    sender_email = (
-        os.environ.get("SENDER_EMAIL", "").strip()
-        or os.environ.get("BREVO_SENDER_EMAIL", "").strip()
-        or "mdhaseebuddin24@gmail.com"
-    )
-    sender_name = os.environ.get("SENDER_NAME", "").strip() or "VeloTest Security"
-    return {"name": sender_name, "email": sender_email}
+# In-memory OAuth2 token cache
+_cached_access_token: Optional[str] = None
+_token_expiry_timestamp: float = 0.0
 
 
 # ==========================================
-# REGEX PATTERNS FOR EMAIL & OTP
+# OAUTH2 ACCESS TOKEN REFRESH
 # ==========================================
-EMAIL_REGEX = re.compile(
-    r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+",
-    re.IGNORECASE
-)
-
-# Pattern 1: Email then OTP ("OTP sent to user@example.com: 593821")
-PATTERN_EMAIL_THEN_OTP = re.compile(
-    r"(?i)\b(?:otp|verification(?:\s*code)?|security\s*code|auth(?:entication)?\s*code|login\s*code|passcode|token|pin|code)\s*(?:sent\s*to|for|to|user|student|candidate)?\s*[:=]?\s*([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)[^\d\n\r]{1,35}?([0-9]{4,8})\b"
-)
-
-# Pattern 2: OTP then Email ("Sent OTP 593821 to user@example.com")
-PATTERN_OTP_THEN_EMAIL = re.compile(
-    r"(?i)\b(?:otp|verification(?:\s*code)?|security\s*code|auth(?:entication)?\s*code|login\s*code|passcode|token|pin|code)\s*(?:is|:|=|-)?\s*([0-9]{4,8})[^\n\r]*?\b(?:to|for|user|student|candidate|email)\s*[:=]?\s*([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)\b"
-)
-
-# Pattern 3: Key-Value structured format ("user: user@example.com | otp: 123456")
-PATTERN_KV_EMAIL_OTP = re.compile(
-    r"(?i)\b(?:user|email|student|candidate|recipient|to)\s*[:=]\s*['\"]?([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)['\"]?[^\n\r]*?\b(?:otp|code|verification|passcode|pin|token)\s*[:=]\s*['\"]?([0-9]{4,8})['\"]?\b"
-)
-
-# Standalone OTP matcher (4 to 8 digits)
-PATTERN_STANDALONE_OTP = re.compile(
-    r"(?i)\b(?:otp|verification(?:\s*code)?|security\s*code|auth(?:entication)?\s*code|login\s*code|one[- ]time\s*password|passcode|pin|token|code)\s*(?:is|:|=|-)?\s*['\"]?([0-9]{4,8})['\"]?\b"
-)
-
-# Optional user-defined custom regex override
-CUSTOM_REGEX = os.environ.get("OTP_CUSTOM_REGEX", "").strip()
-COMPILED_CUSTOM_REGEX = re.compile(CUSTOM_REGEX, re.IGNORECASE) if CUSTOM_REGEX else None
-
-
-# ==========================================
-# PARSER & DEDUPLICATION LOGIC
-# ==========================================
-def parse_log_for_email_and_otp(message: str) -> Optional[Tuple[str, str]]:
+def get_gmail_access_token() -> str:
     """
-    Inspect a single log line message and extract both target user email and OTP.
-    Accommodates VeloTest platform logs in raw text, structured strings, or embedded JSON.
-    Returns (email, otp) tuple if matched, or None.
+    Request a fresh short-lived OAuth2 access token from Google using the refresh token.
+    Caches the token in-memory until near expiration.
     """
-    if not message or not isinstance(message, str):
-        return None
+    global _cached_access_token, _token_expiry_timestamp
 
-    cleaned_msg = message.strip()
-
-    # 1. Embedded JSON inspection
-    if "{" in cleaned_msg and "}" in cleaned_msg:
-        try:
-            start_idx = cleaned_msg.find("{")
-            end_idx = cleaned_msg.rfind("}") + 1
-            json_str = cleaned_msg[start_idx:end_idx]
-            data = json.loads(json_str)
-            if isinstance(data, dict):
-                email_val = None
-                for ek in ("email", "user", "student", "candidate", "recipient", "to", "user_email", "student_email"):
-                    if ek in data and isinstance(data[ek], str) and "@" in data[ek]:
-                        email_val = data[ek].strip()
-                        break
-
-                otp_val = None
-                for ok in ("otp", "code", "verification_code", "verificationCode", "passcode", "pin", "token", "password"):
-                    if ok in data:
-                        val_str = str(data[ok]).strip()
-                        if val_str.isdigit() and 4 <= len(val_str) <= 8:
-                            otp_val = val_str
-                            break
-
-                if email_val and otp_val:
-                    return email_val, otp_val
-        except Exception:
-            pass
-
-    # 2. Custom Regex override if specified in environment
-    if COMPILED_CUSTOM_REGEX:
-        custom_match = COMPILED_CUSTOM_REGEX.search(cleaned_msg)
-        if custom_match:
-            groups = custom_match.groupdict()
-            if "email" in groups and "otp" in groups:
-                return groups["email"].strip(), groups["otp"].strip()
-            elif len(custom_match.groups()) >= 2:
-                g1, g2 = custom_match.group(1).strip(), custom_match.group(2).strip()
-                return (g1, g2) if "@" in g1 else (g2, g1)
-
-    # 3. Check Pattern: Email then OTP
-    match = PATTERN_EMAIL_THEN_OTP.search(cleaned_msg)
-    if match:
-        email, otp = match.group(1).strip(), match.group(2).strip()
-        return email, otp
-
-    # 4. Check Pattern: OTP then Email
-    match = PATTERN_OTP_THEN_EMAIL.search(cleaned_msg)
-    if match:
-        otp, email = match.group(1).strip(), match.group(2).strip()
-        return email, otp
-
-    # 5. Check Pattern: Structured Key-Value
-    match = PATTERN_KV_EMAIL_OTP.search(cleaned_msg)
-    if match:
-        email, otp = match.group(1).strip(), match.group(2).strip()
-        return email, otp
-
-    # 6. Universal Heuristic Fallback
-    lower_msg = cleaned_msg.lower()
-    otp_indicators = (
-        "otp", "verification", "verify", "auth", "login",
-        "code", "pin", "passcode", "token", "velotest", "exam"
-    )
-    if any(k in lower_msg for k in otp_indicators):
-        email_match = EMAIL_REGEX.search(cleaned_msg)
-        if email_match:
-            candidate_email = email_match.group(0).strip()
-            otp_match = PATTERN_STANDALONE_OTP.search(cleaned_msg)
-            if otp_match:
-                return candidate_email, otp_match.group(1).strip()
-            msg_without_email = cleaned_msg.replace(candidate_email, "")
-            digits = re.findall(r"\b[0-9]{4,8}\b", msg_without_email)
-            if digits:
-                return candidate_email, digits[-1].strip()
-
-    return None
-
-
-def is_duplicate(email: str, otp: str) -> bool:
-    """
-    Check if the (email, otp) pair was already dispatched within DEDUP_CACHE_TTL.
-    Periodically cleans up expired entries to conserve memory.
-    """
     now = time.time()
-    key = (email.lower(), otp)
+    if _cached_access_token and now < (_token_expiry_timestamp - 60):
+        return _cached_access_token
 
-    expired_keys = [k for k, ts in _recent_dispatches.items() if now - ts > DEDUP_CACHE_TTL]
-    for k in expired_keys:
-        del _recent_dispatches[k]
+    client_id = os.environ.get("GMAIL_CLIENT_ID", "").strip()
+    client_secret = os.environ.get("GMAIL_CLIENT_SECRET", "").strip()
+    refresh_token = os.environ.get("GMAIL_REFRESH_TOKEN", "").strip()
 
-    if key in _recent_dispatches:
-        return True
+    missing = []
+    if not client_id:
+        missing.append("GMAIL_CLIENT_ID")
+    if not client_secret:
+        missing.append("GMAIL_CLIENT_SECRET")
+    if not refresh_token:
+        missing.append("GMAIL_REFRESH_TOKEN")
 
-    _recent_dispatches[key] = now
-    return False
+    if missing:
+        raise RuntimeError(
+            f"Missing required Gmail OAuth2 environment variables: {', '.join(missing)}"
+        )
+
+    payload = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "refresh_token": refresh_token,
+        "grant_type": "refresh_token",
+    }
+
+    try:
+        response = requests.post(GOOGLE_TOKEN_URL, data=payload, timeout=10)
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"Network error connecting to Google OAuth2 token endpoint: {e}")
+
+    try:
+        token_data = response.json()
+    except Exception:
+        token_data = {}
+
+    if response.status_code != 200 or "access_token" not in token_data:
+        raise RuntimeError(
+            f"Failed to refresh Google OAuth2 access token (HTTP {response.status_code}): {response.text}"
+        )
+
+    access_token = token_data["access_token"]
+    expires_in = int(token_data.get("expires_in", 3600))
+
+    _cached_access_token = access_token
+    _token_expiry_timestamp = now + expires_in
+
+    return access_token
 
 
 # ==========================================
-# BREVO HTTPS REST EMAIL DISPATCHER
+# EMAIL CONSTRUCTION & DISPATCH
 # ==========================================
 def generate_otp_html(otp_code: str) -> str:
-    """
-    Generate clean, responsive HTML email containing the OTP code
-    and a prominent 2-minute validity note.
-    """
+    """Generate clean, responsive HTML email displaying the OTP code with 2-minute validity note."""
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -310,9 +211,9 @@ def generate_otp_html(otp_code: str) -> str:
 </head>
 <body>
   <div class="container">
-    <div class="brand">VeloTest Security</div>
+    <div class="brand">VeloTest</div>
     <h1 class="heading">Verification Code</h1>
-    <p class="instructions">Please enter the one-time verification code below to complete your login.</p>
+    <p class="instructions">Please enter the one-time verification code below to complete your verification.</p>
 
     <div class="otp-card">
       <div class="otp-number">{otp_code}</div>
@@ -324,106 +225,192 @@ def generate_otp_html(otp_code: str) -> str:
 
     <div class="footer">
       If you did not request this verification code, please ignore this email or secure your account.<br>
-      Automated dispatch via VeloTest Security.
+      Automated dispatch via VeloTest Authentication Service.
     </div>
   </div>
 </body>
 </html>"""
 
 
-def dispatch_via_brevo(recipient_email: str, otp_code: str) -> dict:
+def dispatch_gmail_rest_email(recipient_email: str, otp_code: str) -> dict:
     """
-    Dispatch transactional email via Brevo REST API (HTTPS port 443).
-    Logs the Brevo response and returns a structured response dict with HTTP status.
+    Construct an RFC 2822 email, base64url encode it, and dispatch via Gmail REST API.
+    Raises RuntimeError on any failure.
     """
-    brevo_api_key = get_brevo_api_key()
-    if not brevo_api_key:
-        error_msg = "Brevo dispatch failed: BREVO_API_KEY is not configured in environment variables!"
-        logger.error(error_msg)
-        return {"status_code": 500, "success": False, "error": error_msg}
+    sender_email = os.environ.get("SENDER_EMAIL", "velotest2026@gmail.com").strip() or "velotest2026@gmail.com"
 
-    sender = get_sender()
-    html_content = generate_otp_html(otp_code)
+    # 1. Fetch valid OAuth2 access token
+    access_token = get_gmail_access_token()
 
+    # 2. Construct RFC 2822 Email Message
+    msg = EmailMessage()
+    msg["Subject"] = "Your Verification Code"
+    msg["From"] = f"VeloTest <{sender_email}>"
+    msg["To"] = recipient_email
+    msg.set_content(f"Your verification code is: {otp_code}\nExpires in 2 minutes.")
+    msg.add_alternative(generate_otp_html(otp_code), subtype="html")
+
+    # 3. Base64url encode raw bytes
+    raw_bytes = msg.as_bytes()
+    encoded_raw_message = base64.urlsafe_b64encode(raw_bytes).decode("utf-8")
+
+    # 4. Dispatch via Gmail REST API
     headers = {
-        "accept": "application/json",
-        "api-key": brevo_api_key,
-        "content-type": "application/json"
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
     }
-
-    payload = {
-        "sender": sender,
-        "to": [{"email": recipient_email}],
-        "subject": "Your Verification Code",
-        "htmlContent": html_content
-    }
+    payload = {"raw": encoded_raw_message}
 
     try:
-        response = requests.post(
-            BREVO_API_URL,
-            headers=headers,
-            json=payload,
-            timeout=15
-        )
-
-        try:
-            resp_json = response.json()
-        except Exception:
-            resp_json = {"raw": response.text}
-
-        logger.info(
-            f"Brevo API Response Status: {response.status_code} | Output: {json.dumps(resp_json)}"
-        )
-
-        if response.status_code in (200, 201, 202):
-            logger.info(f"✅ Successfully delivered OTP [{otp_code}] to {recipient_email} via Brevo API")
-            return {
-                "status_code": 200,
-                "success": True,
-                "brevo_status": response.status_code,
-                "response": resp_json
-            }
-        else:
-            error_msg = f"Brevo API error (HTTP {response.status_code}): {resp_json}"
-            logger.error(f"❌ {error_msg}")
-            return {
-                "status_code": 500,
-                "success": False,
-                "error": error_msg,
-                "brevo_status": response.status_code,
-                "response": resp_json
-            }
-
+        response = requests.post(GMAIL_SEND_URL, headers=headers, json=payload, timeout=10)
     except requests.exceptions.RequestException as e:
-        error_msg = f"Network exception connecting to Brevo API: {str(e)}"
-        logger.error(f"❌ {error_msg}")
-        return {
-            "status_code": 500,
-            "success": False,
-            "error": error_msg
-        }
-    except Exception as e:
-        error_msg = f"Unexpected error during Brevo dispatch: {str(e)}"
-        logger.error(f"❌ {error_msg}")
-        return {
-            "status_code": 500,
-            "success": False,
-            "error": error_msg
-        }
+        raise RuntimeError(f"Network error connecting to Gmail REST API: {e}")
+
+    if response.status_code not in (200, 201):
+        raise RuntimeError(
+            f"Gmail API dispatch failed (HTTP {response.status_code}): {response.text}"
+        )
+
+    try:
+        res_json = response.json()
+    except Exception:
+        res_json = {"raw": response.text}
+
+    logger.info(
+        f"✅ [Gmail REST API] Delivered OTP [{otp_code}] to {recipient_email}. Message ID: {res_json.get('id')}"
+    )
+    return res_json
 
 
-def dispatch_otp_email(
-    recipient_email: str,
-    otp_code: str,
-    log_timestamp: str = "",
-    log_message: str = ""
-) -> dict:
-    """
-    Background worker function to dispatch OTP via Brevo HTTPS REST API.
-    Does not crash on failure and logs exact response details.
-    """
-    logger.info(f"🚀 Dispatching OTP [{otp_code}] to {recipient_email} via Brevo HTTPS API...")
-    return dispatch_via_brevo(recipient_email=recipient_email, otp_code=otp_code)
+# ==========================================
+# REGEX PATTERNS FOR EMAIL & OTP
+# ==========================================
+EMAIL_REGEX = re.compile(
+    r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+",
+    re.IGNORECASE
+)
+
+PATTERN_EMAIL_THEN_OTP = re.compile(
+    r"(?i)\b(?:otp|verification(?:\s*code)?|security\s*code|auth(?:entication)?\s*code|login\s*code|passcode|token|pin|code)\s*(?:sent\s*to|for|to|user|student|candidate)?\s*[:=]?\s*([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)[^\d\n\r]{1,35}?([0-9]{4,8})\b"
+)
+
+PATTERN_OTP_THEN_EMAIL = re.compile(
+    r"(?i)\b(?:otp|verification(?:\s*code)?|security\s*code|auth(?:entication)?\s*code|login\s*code|passcode|token|pin|code)\s*(?:is|:|=|-)?\s*([0-9]{4,8})[^\n\r]*?\b(?:to|for|user|student|candidate|email)\s*[:=]?\s*([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)\b"
+)
+
+PATTERN_KV_EMAIL_OTP = re.compile(
+    r"(?i)\b(?:user|email|student|candidate|recipient|to)\s*[:=]\s*['\"]?([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)['\"]?[^\n\r]*?\b(?:otp|code|verification|passcode|pin|token)\s*[:=]\s*['\"]?([0-9]{4,8})['\"]?\b"
+)
+
+PATTERN_STANDALONE_OTP = re.compile(
+    r"(?i)\b(?:otp|verification(?:\s*code)?|security\s*code|auth(?:entication)?\s*code|login\s*code|one[- ]time\s*password|passcode|pin|token|code)\s*(?:is|:|=|-)?\s*['\"]?([0-9]{4,8})['\"]?\b"
+)
+
+CUSTOM_REGEX = os.environ.get("OTP_CUSTOM_REGEX", "").strip()
+COMPILED_CUSTOM_REGEX = re.compile(CUSTOM_REGEX, re.IGNORECASE) if CUSTOM_REGEX else None
+
+
+# ==========================================
+# PARSER & DEDUPLICATION LOGIC
+# ==========================================
+def parse_log_for_email_and_otp(message: str) -> Optional[Tuple[str, str]]:
+    """Inspect a single log line message and extract both target user email and OTP."""
+    if not message or not isinstance(message, str):
+        return None
+
+    cleaned_msg = message.strip()
+
+    # 1. Embedded JSON inspection
+    if "{" in cleaned_msg and "}" in cleaned_msg:
+        try:
+            start_idx = cleaned_msg.find("{")
+            end_idx = cleaned_msg.rfind("}") + 1
+            json_str = cleaned_msg[start_idx:end_idx]
+            data = json.loads(json_str)
+            if isinstance(data, dict):
+                email_val = None
+                for ek in ("email", "user", "student", "candidate", "recipient", "to", "user_email", "student_email"):
+                    if ek in data and isinstance(data[ek], str) and "@" in data[ek]:
+                        email_val = data[ek].strip()
+                        break
+
+                otp_val = None
+                for ok in ("otp", "code", "verification_code", "verificationCode", "passcode", "pin", "token", "password"):
+                    if ok in data:
+                        val_str = str(data[ok]).strip()
+                        if val_str.isdigit() and 4 <= len(val_str) <= 8:
+                            otp_val = val_str
+                            break
+
+                if email_val and otp_val:
+                    return email_val, otp_val
+        except Exception:
+            pass
+
+    # 2. Custom Regex override if specified in environment
+    if COMPILED_CUSTOM_REGEX:
+        custom_match = COMPILED_CUSTOM_REGEX.search(cleaned_msg)
+        if custom_match:
+            groups = custom_match.groupdict()
+            if "email" in groups and "otp" in groups:
+                return groups["email"].strip(), groups["otp"].strip()
+            elif len(custom_match.groups()) >= 2:
+                g1, g2 = custom_match.group(1).strip(), custom_match.group(2).strip()
+                return (g1, g2) if "@" in g1 else (g2, g1)
+
+    # 3. Check Pattern: Email then OTP
+    match = PATTERN_EMAIL_THEN_OTP.search(cleaned_msg)
+    if match:
+        email, otp = match.group(1).strip(), match.group(2).strip()
+        return email, otp
+
+    # 4. Check Pattern: OTP then Email
+    match = PATTERN_OTP_THEN_EMAIL.search(cleaned_msg)
+    if match:
+        otp, email = match.group(1).strip(), match.group(2).strip()
+        return email, otp
+
+    # 5. Check Pattern: Structured Key-Value
+    match = PATTERN_KV_EMAIL_OTP.search(cleaned_msg)
+    if match:
+        email, otp = match.group(1).strip(), match.group(2).strip()
+        return email, otp
+
+    # 6. Universal Heuristic Fallback
+    lower_msg = cleaned_msg.lower()
+    otp_indicators = (
+        "otp", "verification", "verify", "auth", "login",
+        "code", "pin", "passcode", "token", "velotest", "exam"
+    )
+    if any(k in lower_msg for k in otp_indicators):
+        email_match = EMAIL_REGEX.search(cleaned_msg)
+        if email_match:
+            candidate_email = email_match.group(0).strip()
+            otp_match = PATTERN_STANDALONE_OTP.search(cleaned_msg)
+            if otp_match:
+                return candidate_email, otp_match.group(1).strip()
+            msg_without_email = cleaned_msg.replace(candidate_email, "")
+            digits = re.findall(r"\b[0-9]{4,8}\b", msg_without_email)
+            if digits:
+                return candidate_email, digits[-1].strip()
+
+    return None
+
+
+def is_duplicate(email: str, otp: str) -> bool:
+    """Check if the (email, otp) pair was already dispatched within DEDUP_CACHE_TTL."""
+    now = time.time()
+    key = (email.lower(), otp)
+
+    expired_keys = [k for k, ts in _recent_dispatches.items() if now - ts > DEDUP_CACHE_TTL]
+    for k in expired_keys:
+        del _recent_dispatches[k]
+
+    if key in _recent_dispatches:
+        return True
+
+    _recent_dispatches[key] = now
+    return False
 
 
 # ==========================================
@@ -431,8 +418,8 @@ def dispatch_otp_email(
 # ==========================================
 app = FastAPI(
     title="VeloTest Render Real-Time OTP Webhook Agent",
-    description="Sub-second OTP log parser and Brevo HTTPS email dispatcher for VeloTest on Render",
-    version="2.2.0"
+    description="Sub-second OTP log parser and Gmail REST API email dispatcher for VeloTest on Render",
+    version="3.0.0"
 )
 
 
@@ -453,13 +440,13 @@ def health_check():
 @app.post("/webhook")
 async def receive_render_logs(
     request: Request,
-    background_tasks: BackgroundTasks,
     authorization: Optional[str] = Header(None)
 ):
     """
     Real-time webhook endpoint receiving log streams from Render Log Drain.
-    Accepts JSON arrays, single log entries, NDJSON, and gzip compressed streams.
-    Extracts dynamic candidate/user emails & OTP codes, dispatching emails over Brevo HTTPS.
+    Parses dynamic candidate/user emails & OTP codes, and invokes the Gmail REST API dispatcher.
+    Returns HTTP 200 with status: success and channel: gmail_rest_api.
+    Catches exceptions safely, logs [ERROR] Gmail API dispatch failed: <err>, and returns HTTP 500 without crashing.
     """
     # 1. Optional Webhook Authentication Token Check
     if WEBHOOK_SECRET:
@@ -495,7 +482,6 @@ async def receive_render_logs(
             if isinstance(payload, list):
                 logs_to_inspect = payload
             elif isinstance(payload, dict):
-                # Standard Render Log Stream formats
                 if "logs" in payload and isinstance(payload["logs"], list):
                     logs_to_inspect = payload["logs"]
                 elif "logLines" in payload and isinstance(payload["logLines"], list):
@@ -505,7 +491,6 @@ async def receive_render_logs(
                 else:
                     logs_to_inspect = [payload]
         else:
-            # Fallback: Plaintext lines / Syslog / NDJSON
             lines = raw_body.decode("utf-8", errors="replace").splitlines()
             for line in lines:
                 line_str = line.strip()
@@ -534,10 +519,8 @@ async def receive_render_logs(
     for entry in logs_to_inspect:
         if isinstance(entry, dict):
             message = entry.get("message") or entry.get("text") or entry.get("msg") or str(entry)
-            timestamp = entry.get("timestamp") or entry.get("time") or ""
         else:
             message = str(entry)
-            timestamp = ""
 
         # Extract (email, otp)
         result = parse_log_for_email_and_otp(message)
@@ -550,19 +533,29 @@ async def receive_render_logs(
                 continue
 
             matched_count += 1
-            dispatched_items.append({"email": user_email, "otp": otp})
+            logger.info(f"🚀 Invoking Gmail REST API dispatcher for {user_email} (OTP: {otp})...")
 
-            # Queue non-blocking email dispatch in the background
-            background_tasks.add_task(
-                dispatch_otp_email,
-                recipient_email=user_email,
-                otp_code=otp,
-                log_timestamp=timestamp,
-                log_message=message
-            )
+            try:
+                dispatch_res = dispatch_gmail_rest_email(recipient_email=user_email, otp_code=otp)
+                dispatched_items.append({
+                    "email": user_email,
+                    "otp": otp,
+                    "message_id": dispatch_res.get("id")
+                })
+            except Exception as err:
+                logger.error(f"[ERROR] Gmail API dispatch failed: {err}")
+                return JSONResponse(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    content={
+                        "status": "error",
+                        "channel": "gmail_rest_api",
+                        "detail": str(err)
+                    }
+                )
 
     return {
         "status": "success",
+        "channel": "gmail_rest_api",
         "processed_logs": len(logs_to_inspect),
         "otps_matched": matched_count,
         "dispatched": dispatched_items
@@ -578,18 +571,32 @@ async def test_send(
     otp: str = "593821"
 ):
     """
-    Direct test endpoint to simulate and verify Brevo HTTPS email dispatch.
-    Returns HTTP 200 on success (Brevo 200, 201, 202) or HTTP 500 on failure without crashing.
+    Direct test endpoint to simulate and verify Gmail REST API email dispatch.
+    Returns HTTP 200 on success or HTTP 500 on failure without crashing the server.
     Example: POST /test-send?email=candidate@example.com&otp=123456
     """
     if not email or "@" not in email:
         raise HTTPException(status_code=400, detail="Valid email query param is required")
 
-    result = dispatch_via_brevo(recipient_email=email, otp_code=otp)
-    if result.get("status_code") == 200:
-        return JSONResponse(status_code=status.HTTP_200_OK, content=result)
-    else:
-        return JSONResponse(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, content=result)
+    try:
+        dispatch_res = dispatch_gmail_rest_email(recipient_email=email, otp_code=otp)
+        return {
+            "status": "success",
+            "channel": "gmail_rest_api",
+            "email": email,
+            "otp": otp,
+            "message_id": dispatch_res.get("id")
+        }
+    except Exception as err:
+        logger.error(f"[ERROR] Gmail API dispatch failed: {err}")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "status": "error",
+                "channel": "gmail_rest_api",
+                "detail": str(err)
+            }
+        )
 
 
 if __name__ == "__main__":
